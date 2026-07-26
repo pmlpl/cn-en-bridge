@@ -13,9 +13,15 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { translateEnToZh, clearTranslationCache, type TranslateAuth } from "./translate.ts";
 
-// 翻译用的模型，可通过环境变量 TRANSLATE_MODEL 覆盖
-// 不设的话 fallback 到当前会话主模型
-const DEFAULT_TRANSLATE_MODEL = "anthropic/claude-haiku-4-5";
+// 翻译用的默认模型：DeepSeek V4 Flash。
+// 选择理由（2026-07 验证）：
+//   - 价格：$0.14/$0.28 per M tokens（平时），比 Claude Haiku 4.5 ($1/$5) 便宜约 16 倍
+//   - 峰谷定价：北京时间工作日 9-12、14-18 点价格翻倍，但仍比 Haiku 便宜 8 倍
+//   - 缓存命中：输入仅 $0.0028/M，重复 systemPrompt 几乎零成本
+//   - 质量：SWE-bench 79.0%，翻译这种语义对等任务绰绰有余
+//   - 上下文：1M tokens，远超翻译所需
+// 可通过环境变量 TRANSLATE_MODEL 覆盖；不设的话 fallback 到当前会话主模型
+const DEFAULT_TRANSLATE_MODEL = "deepseek/deepseek-v4-flash";
 
 interface ModelLike {
   id: string;
@@ -163,6 +169,7 @@ async function resolveAuth(ctx: ExtensionContext, model: ModelLike): Promise<Tra
   return {
     apiKey:
       process.env.TRANSLATE_API_KEY ||
+      process.env.DEEPSEEK_API_KEY ||
       process.env.ANTHROPIC_API_KEY ||
       process.env.OPENAI_API_KEY,
   };
