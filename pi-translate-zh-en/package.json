@@ -1,13 +1,12 @@
 {
-  "name": "pi-translate-zh-en",
-  "version": "0.1.0",
-  "description": "Pi extension: transparent Chinese-English translation layer to save tokens. User types Chinese, model thinks in English.",
+  "name": "pi-translate-output-zh",
+  "version": "0.2.0",
+  "description": "Pi extension: translate assistant English responses to Chinese. Designed to pair with pi-prompt-translate (input side).",
   "type": "module",
   "keywords": ["pi-package"],
   "files": [
     "index.ts",
     "translate.ts",
-    "language-detector.ts",
     "cache.ts"
   ],
   "pi": {

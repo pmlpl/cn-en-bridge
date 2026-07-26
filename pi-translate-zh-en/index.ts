@@ -1,30 +1,21 @@
-// Pi 扩展入口：中英互转省 token 翻译层
+// Pi 扩展入口：把 assistant 的英文输出翻译成中文。
 //
-// 工作流程：
-//   1. 用户输入中文  →  pi.on("input")            → 翻译成英文，transform 后发给模型
-//   2. 模型推理前    →  pi.on("before_agent_start") → 注入 systemPrompt 引导模型始终用英文
-//   3. 模型输出完成  →  pi.on("message_end")       → 翻译 assistant 英文回复为中文，写进 session
+// 这是一个"输出侧"翻译扩展，专门配合 pi-prompt-translate（输入侧翻译）使用：
+//   - 输入侧（pi-prompt-translate）：用户中文 → 翻译成英文发给模型
+//   - 输出侧（本扩展）：模型英文回复 → 翻译成中文展示给用户
+//
+// 只 hook 一个事件：message_end。拿到 assistant 英文 message 后翻译成中文，
+// return {message} 替换写进 session。其他事件都不动，避免和 pi-prompt-translate 冲突。
 //
 // 参考实现：
-//   - input-transform.ts           (input 事件 transform 用法)
-//   - prompt-customizer.ts         (before_agent_start 改 systemPromptOptions)
-//   - context-projection (第三方)  (嵌套 LLM 调用 + ctx.modelRegistry 用法)
-//   - answer (第三方)              (complete() 调用模板)
+//   - pi-prompt-translate/extensions/index.ts  (completeSimple + reasoning:"low" + getApiKeyAndHeaders)
+//   - Pi 官方 examples/extensions/  (message_end 事件 return {message} 替换模式)
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { translateZhToEn, translateEnToZh, clearTranslationCache, type TranslateAuth } from "./translate.ts";
+import { translateEnToZh, clearTranslationCache, type TranslateAuth } from "./translate.ts";
 
 // 翻译用的模型，可通过环境变量 TRANSLATE_MODEL 覆盖
+// 不设的话 fallback 到当前会话主模型
 const DEFAULT_TRANSLATE_MODEL = "anthropic/claude-haiku-4-5";
-
-// 引导主模型始终用英文回复的 system prompt 片段
-const SYSTEM_PROMPT_HINT = [
-  "IMPORTANT — Translation Layer Active:",
-  "The user types in Chinese, but a translation layer converts all user input to English before it reaches you.",
-  "You MUST:",
-  "1. Always respond in English (the layer will translate your reply back to Chinese for the user).",
-  "2. Always reason, write code, and write comments in English unless the user explicitly asks for Chinese.",
-  "3. Do not mention the translation layer or apologize for language — just respond naturally in English.",
-].join("\n");
 
 interface ModelLike {
   id: string;
@@ -32,85 +23,48 @@ interface ModelLike {
 }
 
 interface ModelRegistryLike {
-  find?: (modelId: string) => ModelLike | Promise<ModelLike>;
+  find?: (provider: string, modelId: string) => ModelLike | Promise<ModelLike>;
+  getApiKeyAndHeaders?: (model: ModelLike) => TranslateAuth | Promise<TranslateAuth>;
   getRequestAuth?: (model: ModelLike) => TranslateAuth | Promise<TranslateAuth>;
 }
 
 export default function (pi: ExtensionAPI) {
-  // 运行时开关，初始值由 --translate / --no-translate flag 决定
+  // 运行时开关
   let enabled = true;
 
-  // 1. CLI flag：`pi --no-translate` 临时关闭
-  pi.registerFlag("translate", {
-    description: "Enable Chinese-English translation layer (default: true)",
+  // 1. CLI flag：`pi --no-translate-output` 临时关闭
+  pi.registerFlag("translate-output", {
+    description: "Translate assistant English responses to Chinese (default: true)",
     type: "boolean",
     default: true,
   });
 
-  // 2. /translate 命令：运行时切换 + 清缓存
-  //    用法：/translate on | /translate off | /translate (toggle)
-  pi.registerCommand("translate", {
-    description: "Toggle the Chinese-English translation layer on/off (args: on|off|clear)",
+  // 2. /translate-output 命令：运行时切换 + 清缓存
+  //    用法：/translate-output on | off | clear | (toggle)
+  pi.registerCommand("translate-output", {
+    description: "Toggle English→Chinese output translation on/off (args: on|off|clear)",
     handler: async (args, ctx) => {
       const arg = (args || "").trim().toLowerCase();
       if (arg === "off" || arg === "disable") {
         enabled = false;
-        ctx.ui.notify("Translation: OFF", "info");
+        ctx.ui.notify("Output translation: OFF", "info");
       } else if (arg === "on" || arg === "enable") {
         enabled = true;
-        ctx.ui.notify("Translation: ON", "info");
+        ctx.ui.notify("Output translation: ON", "info");
       } else if (arg === "clear") {
         clearTranslationCache();
         ctx.ui.notify("Translation cache cleared", "info");
       } else {
         enabled = !enabled;
-        ctx.ui.notify(`Translation: ${enabled ? "ON" : "OFF"}`, "info");
+        ctx.ui.notify(`Output translation: ${enabled ? "ON" : "OFF"}`, "info");
       }
     },
   });
 
-  // 3. 拦截用户输入：中文 → 英文
-  pi.on("input", async (event: any, ctx: ExtensionContext) => {
-    if (!enabled) return;
-    // 跳过 steering 期间（要低延迟）
-    if (event.streamingBehavior === "steer") return;
-
-    const text = event.text;
-    if (typeof text !== "string" || !text.trim()) return;
-
-    try {
-      const model = await resolveTranslateModel(ctx);
-      const auth = await resolveAuth(ctx, model);
-      const translated = await translateZhToEn(text, model, {
-        signal: (ctx as any).signal,
-        auth,
-      });
-
-      if (translated && translated !== text) {
-        const preview = translated.length > 60 ? translated.slice(0, 60) + "…" : translated;
-        ctx.ui.setStatus?.(`zh→en: ${preview}`, "info");
-        return { action: "transform", text: translated };
-      }
-    } catch (err) {
-      ctx.ui.notify(
-        `Translation failed (input passthrough): ${(err as Error).message}`,
-        "warn",
-      );
-    }
-  });
-
-  // 4. 注入 systemPrompt 引导主模型始终用英文回复
-  pi.on("before_agent_start", async (event: any, _ctx: ExtensionContext) => {
-    if (!enabled) return;
-    if (!event || !event.systemPromptOptions) return;
-    const opts = event.systemPromptOptions;
-    opts.extraRules = Array.isArray(opts.extraRules) ? opts.extraRules : [];
-    opts.extraRules.push(SYSTEM_PROMPT_HINT);
-  });
-
-  // 5. 拦截模型输出：英文 → 中文
+  // 3. 拦截 assistant 输出：英文 → 中文
   pi.on("message_end", async (event: any, ctx: ExtensionContext) => {
     if (!enabled) return;
+
     const message = event?.message;
     if (!message || message.role !== "assistant") return;
 
@@ -132,6 +86,7 @@ export default function (pi: ExtensionAPI) {
     const newContent = await Promise.all(
       content.map(async (part: any) => {
         // 只翻译 text part；tool_use / thinking / 其他 part 原样保留
+        // （tool_use 是工具调用结构化数据，翻译会破坏语义；thinking 是模型内部推理，不需要给用户看）
         if (!part || part.type !== "text") return part;
         const text = typeof part.text === "string" ? part.text : "";
         if (!text.trim()) return part;
@@ -149,7 +104,7 @@ export default function (pi: ExtensionAPI) {
           }
         } catch (err) {
           ctx.ui.notify(
-            `Translation failed (output passthrough): ${(err as Error).message}`,
+            `Output translation failed (passthrough): ${(err as Error).message}`,
             "warn",
           );
         }
@@ -168,16 +123,36 @@ export default function (pi: ExtensionAPI) {
 async function resolveTranslateModel(ctx: ExtensionContext): Promise<ModelLike> {
   const modelName = process.env.TRANSLATE_MODEL || DEFAULT_TRANSLATE_MODEL;
   const registry = (ctx as any).modelRegistry as ModelRegistryLike | undefined;
-  if (registry?.find) {
-    const model = await registry.find(modelName);
-    if (model) return model;
+
+  // 兼容 pi-prompt-translate 的格式："provider/modelId"
+  if (registry?.find && modelName.includes("/")) {
+    const slashIdx = modelName.indexOf("/");
+    const provider = modelName.slice(0, slashIdx);
+    const modelId = modelName.slice(slashIdx + 1);
+    try {
+      const found = await registry.find(provider, modelId);
+      if (found) return found;
+    } catch {
+      // 落到兜底
+    }
   }
-  // 兜底：返回一个最小 model 对象，complete() 会用默认 provider
+  // 兜底：用当前会话主模型
+  const ctxModel = (ctx as any).model as ModelLike | undefined;
+  if (ctxModel) return ctxModel;
   return { id: modelName };
 }
 
 async function resolveAuth(ctx: ExtensionContext, model: ModelLike): Promise<TranslateAuth> {
   const registry = (ctx as any).modelRegistry as ModelRegistryLike | undefined;
+  // pi-prompt-translate 用的方法名是 getApiKeyAndHeaders
+  if (registry?.getApiKeyAndHeaders) {
+    try {
+      return await registry.getApiKeyAndHeaders(model);
+    } catch {
+      // 落到环境变量兜底
+    }
+  }
+  // 另一个可能的方法名
   if (registry?.getRequestAuth) {
     try {
       return await registry.getRequestAuth(model);
