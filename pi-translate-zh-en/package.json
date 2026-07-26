@@ -1,6 +1,6 @@
 {
   "name": "pi-translate-output-zh",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Pi extension: translate assistant English responses to Chinese. Designed to pair with pi-prompt-translate (input side).",
   "type": "module",
   "keywords": ["pi-package"],
