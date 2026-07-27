@@ -11,13 +11,27 @@
 //   - session_start：首次启动检测 DeepSeek 配置，缺失则引导用户配置 API key
 //
 // 兼容性：检测到 pi-prompt-translate 已安装则自动禁用输入侧 hook，避免重复翻译。
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as process from "node:process";
+
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionUIContext,
+  ModelRegistry,
+  ProviderConfig,
+  ProviderModelConfig,
+} from "@earendil-works/pi-coding-agent";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   translateZhToEn,
   translateEnToZh,
   clearTranslationCache,
   type TranslateAuth,
 } from "./translate.ts";
+import { containsCJK } from "./cjk.ts";
 
 // 翻译用的默认模型：DeepSeek V4 Flash。
 // 选择理由（2026-07 验证）：
@@ -38,77 +52,73 @@ const ENGLISH_REPLY_SYSTEM_PROMPT =
   "Code, technical terms, and proper nouns remain in their original form. " +
   "This helps reduce token usage and improve response consistency.";
 
-interface ModelLike {
-  id: string;
-  provider?: string;
+// 输入侧翻译超时：超过这个时间还没拿到翻译结果就放行原文，避免阻塞用户输入。
+const INPUT_TRANSLATE_TIMEOUT_MS = 3000;
+
+// Windows 的权限模型和 POSIX 不一样：chmod 基本是空操作。
+// 在 Windows 上跳过 chmod 相关调用，改用提示告知用户。
+const isWindows = process.platform === "win32";
+
+// DeepSeek V4-Flash 模型定义。cost 用平时价（$0.14/$0.28 per M tokens），
+// cacheRead 用 $0.0028/M（缓存命中价）。单位是 $/M tokens。
+const DEEPSEEK_V4_FLASH_MODEL: ProviderModelConfig = {
+  id: "deepseek-v4-flash",
+  name: "DeepSeek V4 Flash (翻译用)",
+  reasoning: false,
+  maxTokens: 8192,
+  contextWindow: 1000000,
+  input: ["text"],
+  cost: {
+    input: 0.00014,
+    output: 0.00028,
+    cacheRead: 0.0000028,
+    cacheWrite: 0,
+  },
+};
+
+// DeepSeek 官方 OpenAI 兼容端点。apiKey 由调用方传入（支持 $ENV / !command 形式）。
+function buildDeepSeekProviderConfig(apiKey: string): ProviderConfig {
+  return {
+    baseUrl: "https://api.deepseek.com",
+    apiKey,
+    api: "openai-completions",
+    models: [DEEPSEEK_V4_FLASH_MODEL],
+  };
 }
 
-interface ModelRegistryLike {
-  find?: (provider: string, modelId: string) => ModelLike | Promise<ModelLike>;
-  getApiKeyAndHeaders?: (model: ModelLike) => TranslateAuth | Promise<TranslateAuth>;
-  getRequestAuth?: (model: ModelLike) => TranslateAuth | Promise<TranslateAuth>;
+// ---- 模块级 fs/path 辅助 ----
+// 把 fs/os/path 相关逻辑提到模块级，避免在函数体内 require()（ESM 不支持 require）。
+function piAgentDir(): string {
+  return path.join(os.homedir(), ".pi", "agent");
+}
+function setupMarkerPath(): string {
+  return path.join(piAgentDir(), ".translate-setup-done");
+}
+function deepSeekKeyPath(): string {
+  return path.join(piAgentDir(), ".deepseek-key");
+}
+function ensurePiAgentDir(): void {
+  fs.mkdirSync(piAgentDir(), { recursive: true });
 }
 
-// registerProvider 接口（参考 https://aliou.me/posts/custom-providers-in-pi/）
-interface ProviderModelDef {
-  id: string;
-  name?: string;
-  reasoning?: boolean;
-  maxTokens?: number;
-  contextWindow?: number;
-  input?: string[];
-}
-
-interface ProviderConfig {
-  baseUrl: string;
-  apiKey: string;
-  api: "openai-completions" | "anthropic-messages" | string;
-  models: ProviderModelDef[];
-  compat?: Record<string, any>;
-}
-
-interface ExtensionAPIWithProvider extends ExtensionAPI {
-  registerProvider?: (name: string, config: ProviderConfig) => void | Promise<void>;
-  appendEntry?: (type: string, data?: any) => void | Promise<void>;
-  events?: { emit: (event: string, data?: any) => void };
-  getRegisteredCommands?: () => string[];
-}
-
-// DeepSeek 官方 OpenAI 兼容端点 + V4-Flash 模型定义。
-const DEEPSEEK_PROVIDER_CONFIG = (apiKeyEnvName: string): ProviderConfig => ({
-  baseUrl: "https://api.deepseek.com",
-  apiKey: apiKeyEnvName,
-  api: "openai-completions",
-  models: [
-    {
-      id: "deepseek-v4-flash",
-      name: "DeepSeek V4 Flash (翻译用)",
-      reasoning: false,
-      maxTokens: 8192,
-      contextWindow: 1000000,
-      input: ["text"],
-    },
-  ],
-});
-
-// CJK Unicode 范围检测：判断文本是否包含中文/日文/韩文字符。
-// 如果用户输入纯英文（或代码），就不需要翻译，直接放行。
-function containsCJK(text: string): boolean {
-  for (const ch of text) {
-    const code = ch.codePointAt(0);
-    if (!code) continue;
-    if (code >= 0x4e00 && code <= 0x9fff) return true; // CJK 统一表意文字
-    if (code >= 0x3400 && code <= 0x4dbf) return true; // CJK 扩展 A
-    if (code >= 0xf900 && code <= 0xfaff) return true; // CJK 兼容表意文字
-    if (code >= 0x3040 && code <= 0x30ff) return true; // 平假名 / 片假名
-    if (code >= 0xac00 && code <= 0xd7af) return true; // 韩文音节
+// ---- input 翻译超时控制 ----
+// 翻译超过 ms 毫秒还没返回就放行 fallback（原文），不阻塞用户输入。
+async function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  return false;
 }
+
+// 首次引导的内存级缓存标记。一个布尔值足够：SETUP_ENTRY_TYPE 是固定字符串。
+let setupDoneInMemory = false;
 
 export default function (pi: ExtensionAPI) {
-  const piExt = pi as ExtensionAPIWithProvider;
-
   let inputEnabled = true;
   let outputEnabled = true;
 
@@ -168,17 +178,17 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("translate-setup", {
     description: "Configure DeepSeek API key for translation (interactive setup)",
     handler: async (_args, ctx) => {
-      await runDeepSeekSetup(piExt, ctx, { force: true });
+      await runDeepSeekSetup(pi, ctx, { force: true });
     },
   });
 
   // 4. session_start：首次启动自动检测 + 引导配置 DeepSeek
-  pi.on("session_start", async (_event: any, ctx: ExtensionContext) => {
+  pi.on("session_start", async (_event, ctx) => {
     if (process.env.DEEPSEEK_API_KEY || process.env.TRANSLATE_API_KEY) return;
     const skip = process.env.TRANSLATE_SKIP_SETUP?.toLowerCase();
     if (skip === "false" || skip === "0" || skip === "no") return;
-    if (hasSetupEntry(piExt)) return;
-    await runDeepSeekSetup(piExt, ctx, { force: false });
+    if (hasSetupEntry(pi)) return;
+    await runDeepSeekSetup(pi, ctx, { force: false });
   });
 
   // 5. 检测 pi-prompt-translate 是否已安装。如果已装，禁用输入侧避免重复翻译。
@@ -186,8 +196,10 @@ export default function (pi: ExtensionAPI) {
   function isPromptTranslateInstalled(): boolean {
     if (promptTranslateDetected !== null) return promptTranslateDetected;
     try {
-      const cmds = piExt.getRegisteredCommands?.();
-      promptTranslateDetected = !!(cmds && cmds.some((c) => c.includes("translate-toggle") || c.includes("translate-lang")));
+      const cmds = pi.getCommands();
+      promptTranslateDetected = cmds.some(
+        (c) => c.name.includes("translate-toggle") || c.name.includes("translate-lang"),
+      );
     } catch {
       promptTranslateDetected = false;
     }
@@ -195,7 +207,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // 6. input 事件：用户中文输入 → 翻译成英文发给模型
-  pi.on("input", async (event: any, ctx: ExtensionContext) => {
+  pi.on("input", async (event, ctx) => {
     if (!inputEnabled) return;
     if (isPromptTranslateInstalled()) return;
 
@@ -206,46 +218,45 @@ export default function (pi: ExtensionAPI) {
     try {
       const model = await resolveTranslateModel(ctx);
       const auth = await resolveAuth(ctx, model);
-      const translated = await translateZhToEn(text, model, {
-        signal: (ctx as any).signal,
-        auth,
-      });
+      // 翻译加超时：超过 3 秒放行原文，不阻塞用户输入。
+      const translated = await withTimeout(
+        translateZhToEn(text, model, { signal: ctx.signal, auth }),
+        INPUT_TRANSLATE_TIMEOUT_MS,
+        text,
+      );
       if (translated && translated !== text) {
-        return { action: "transform", text: translated };
+        return { action: "transform" as const, text: translated };
       }
     } catch (err) {
       ctx.ui.notify(
         `Input translation failed (passthrough): ${(err as Error).message}`,
-        "warn",
+        "warning",
       );
     }
   });
 
   // 7. before_agent_start：注入 systemPrompt 引导模型用英文回复
-  pi.on("before_agent_start", async (_event: any, _ctx: ExtensionContext) => {
+  // 官方 BeforeAgentStartEventResult 只支持 { message?, systemPrompt? }，
+  // 要追加规则只能替换整个 systemPrompt：在原 prompt 后拼一段。
+  pi.on("before_agent_start", async (event, _ctx) => {
     if (!inputEnabled) return;
     if (isPromptTranslateInstalled()) return;
     return {
-      systemPromptOptions: {
-        extraRules: [ENGLISH_REPLY_SYSTEM_PROMPT],
-      },
+      systemPrompt: `${event.systemPrompt}\n\n${ENGLISH_REPLY_SYSTEM_PROMPT}`,
     };
   });
 
   // 8. message_end 事件：模型英文输出 → 翻译成中文展示给用户
-  pi.on("message_end", async (event: any, ctx: ExtensionContext) => {
+  pi.on("message_end", async (event, ctx) => {
     if (!outputEnabled) return;
 
     const message = event?.message;
     if (!message || message.role !== "assistant") return;
 
-    const stopReason = event.stopReason;
-    if (
-      stopReason &&
-      stopReason !== "stop" &&
-      stopReason !== "end_turn" &&
-      stopReason !== "max_tokens"
-    ) {
+    // AssistantMessage.stopReason 是规范化的值：stop | length | toolUse | error | aborted。
+    // 只在干净停止或长度上限上翻译；工具调用 / 错误 / 中断不翻。
+    const stopReason = (message as { stopReason?: string }).stopReason;
+    if (stopReason && stopReason !== "stop" && stopReason !== "length") {
       return;
     }
 
@@ -263,7 +274,7 @@ export default function (pi: ExtensionAPI) {
           const model = await resolveTranslateModel(ctx);
           const auth = await resolveAuth(ctx, model);
           const translated = await translateEnToZh(text, model, {
-            signal: (ctx as any).signal,
+            signal: ctx.signal,
             auth,
           });
           if (translated && translated !== text) {
@@ -273,7 +284,7 @@ export default function (pi: ExtensionAPI) {
         } catch (err) {
           ctx.ui.notify(
             `Output translation failed (passthrough): ${(err as Error).message}`,
-            "warn",
+            "warning",
           );
         }
         return part;
@@ -288,41 +299,36 @@ export default function (pi: ExtensionAPI) {
 
 // ---- helpers ----
 
-async function resolveTranslateModel(ctx: ExtensionContext): Promise<ModelLike> {
+async function resolveTranslateModel(ctx: ExtensionContext): Promise<Model<Api>> {
   const modelName = process.env.TRANSLATE_MODEL || DEFAULT_TRANSLATE_MODEL;
-  const registry = (ctx as any).modelRegistry as ModelRegistryLike | undefined;
+  const registry = ctx.modelRegistry;
 
-  if (registry?.find && modelName.includes("/")) {
+  if (modelName.includes("/")) {
     const slashIdx = modelName.indexOf("/");
     const provider = modelName.slice(0, slashIdx);
     const modelId = modelName.slice(slashIdx + 1);
     try {
-      const found = await registry.find(provider, modelId);
+      const found = registry.find(provider, modelId);
       if (found) return found;
     } catch {
       // 落到兜底
     }
   }
-  const ctxModel = (ctx as any).model as ModelLike | undefined;
-  if (ctxModel) return ctxModel;
-  return { id: modelName };
+  if (ctx.model) return ctx.model;
+  // 兜底：仅用 id 构造一个最小 Model。运行时通常用不到这条路径
+  // （completeSimple 会通过 registry 重新解析），这里用 as 避免手搓 Model 全部字段。
+  return { id: modelName } as Model<Api>;
 }
 
-async function resolveAuth(ctx: ExtensionContext, model: ModelLike): Promise<TranslateAuth> {
-  const registry = (ctx as any).modelRegistry as ModelRegistryLike | undefined;
-  if (registry?.getApiKeyAndHeaders) {
-    try {
-      return await registry.getApiKeyAndHeaders(model);
-    } catch {
-      // 落到环境变量兜底
+async function resolveAuth(ctx: ExtensionContext, model: Model<Api>): Promise<TranslateAuth> {
+  const registry = ctx.modelRegistry;
+  try {
+    const auth = await registry.getApiKeyAndHeaders(model);
+    if (auth.ok) {
+      return { apiKey: auth.apiKey, headers: auth.headers };
     }
-  }
-  if (registry?.getRequestAuth) {
-    try {
-      return await registry.getRequestAuth(model);
-    } catch {
-      // 落到环境变量兜底
-    }
+  } catch {
+    // 落到环境变量兜底
   }
   return {
     apiKey:
@@ -335,67 +341,50 @@ async function resolveAuth(ctx: ExtensionContext, model: ModelLike): Promise<Tra
 
 // ---- DeepSeek 首次引导 ----
 
-const setupDoneInMemory = new Set<string>();
-
-function hasSetupEntry(pi: ExtensionAPIWithProvider): boolean {
-  if (setupDoneInMemory.has(SETUP_ENTRY_TYPE)) return true;
+function hasSetupEntry(_pi: ExtensionAPI): boolean {
+  if (setupDoneInMemory) return true;
   try {
-    const fs = require("fs");
-    const os = require("os");
-    const path = require("path");
-    const marker = path.join(os.homedir(), ".pi", "agent", ".translate-setup-done");
-    return fs.existsSync(marker);
+    return fs.existsSync(setupMarkerPath());
   } catch {
     return false;
   }
 }
 
-async function markSetupDone(pi: ExtensionAPIWithProvider, result: "configured" | "skipped"): Promise<void> {
-  setupDoneInMemory.add(SETUP_ENTRY_TYPE);
+async function markSetupDone(
+  pi: ExtensionAPI,
+  result: "configured" | "skipped",
+): Promise<void> {
+  setupDoneInMemory = true;
   try {
-    if (pi.appendEntry) {
-      await pi.appendEntry(SETUP_ENTRY_TYPE, { result, ts: Date.now() });
-    }
-    const fs = require("fs");
-    const os = require("os");
-    const path = require("path");
-    const dir = path.join(os.homedir(), ".pi", "agent");
-    fs.mkdirSync(dir, { recursive: true });
-    const marker = path.join(dir, ".translate-setup-done");
-    fs.writeFileSync(marker, JSON.stringify({ result, ts: Date.now() }), "utf8");
+    pi.appendEntry(SETUP_ENTRY_TYPE, { result, ts: Date.now() });
+    ensurePiAgentDir();
+    fs.writeFileSync(setupMarkerPath(), JSON.stringify({ result, ts: Date.now() }), "utf8");
   } catch {
     // 持久化失败不阻塞主流程
   }
 }
 
-interface UILike {
-  notify?: (msg: string, type?: string) => void;
-  confirm?: (title: string, message: string) => Promise<boolean>;
-  input?: (prompt: string, defaultValue?: string) => Promise<string | undefined>;
-  setStatus?: (status: string) => void;
-}
-
 async function runDeepSeekSetup(
-  pi: ExtensionAPIWithProvider,
+  pi: ExtensionAPI,
   ctx: ExtensionContext,
   opts: { force: boolean },
 ): Promise<void> {
-  const ui = (ctx as any).ui as UILike | undefined;
-  if (!ui) return;
+  const ui: ExtensionUIContext = ctx.ui;
+  const registry: ModelRegistry = ctx.modelRegistry;
 
-  const registry = (ctx as any).modelRegistry as ModelRegistryLike | undefined;
   let alreadyConfigured = false;
-  if (registry?.find) {
-    try {
-      const found = await registry.find("deepseek", "deepseek-v4-flash");
-      alreadyConfigured = !!found;
-    } catch {
-      // 没找到，继续引导
-    }
+  try {
+    const found = registry.find("deepseek", "deepseek-v4-flash");
+    alreadyConfigured = !!found;
+  } catch {
+    // 没找到，继续引导
   }
   if (alreadyConfigured) {
     if (opts.force) {
-      ui.notify?.("DeepSeek 已配置完毕，无需重复配置。如需更换 key，删除 ~/.pi/agent/.deepseek-key 后重启。", "info");
+      ui.notify(
+        "DeepSeek 已配置完毕，无需重复配置。如需更换 key，删除 ~/.pi/agent/.deepseek-key 后重启。",
+        "info",
+      );
     }
     await markSetupDone(pi, "configured");
     return;
@@ -410,9 +399,9 @@ async function runDeepSeekSetup(
     "  - 否：翻译会 fallback 到当前主模型（不省钱但不报错）\n" +
     "       可随时运行 /translate-setup 重新配置";
 
-  const wantSetup = ui.confirm ? await ui.confirm(title, message) : false;
+  const wantSetup = ctx.hasUI ? await ui.confirm(title, message) : false;
   if (!wantSetup) {
-    ui.notify?.(
+    ui.notify(
       "已跳过 DeepSeek 配置。翻译将使用主模型。运行 /translate-setup 可重新配置。",
       "info",
     );
@@ -420,8 +409,11 @@ async function runDeepSeekSetup(
     return;
   }
 
-  if (!ui.input) {
-    ui.notify?.("当前 Pi 版本不支持 input UI。请手动设置：export DEEPSEEK_API_KEY=sk-...", "warn");
+  if (!ctx.hasUI) {
+    ui.notify(
+      "当前 Pi 版本不支持 input UI。请手动设置：export DEEPSEEK_API_KEY=sk-...",
+      "warning",
+    );
     await markSetupDone(pi, "skipped");
     return;
   }
@@ -431,53 +423,48 @@ async function runDeepSeekSetup(
   );
   const trimmedKey = (userInput || "").trim();
   if (!trimmedKey) {
-    ui.notify?.("未输入 key，已取消配置。可随时运行 /translate-setup 重新配置。", "warn");
+    ui.notify("未输入 key，已取消配置。可随时运行 /translate-setup 重新配置。", "warning");
     await markSetupDone(pi, "skipped");
     return;
   }
 
   let keyFile = "";
   try {
-    const fs = require("fs");
-    const os = require("os");
-    const path = require("path");
-    const dir = path.join(os.homedir(), ".pi", "agent");
-    fs.mkdirSync(dir, { recursive: true });
-    keyFile = path.join(dir, ".deepseek-key");
-    fs.writeFileSync(keyFile, trimmedKey, { mode: 0o600 });
-    fs.chmodSync(keyFile, 0o600);
-  } catch (err) {
-    ui.notify?.(`保存 key 文件失败：${(err as Error).message}`, "error");
-    await markSetupDone(pi, "skipped");
-    return;
-  }
-
-  if (pi.registerProvider) {
-    try {
-      const readKeyCmd = `!cat "${keyFile}"`;
-      const config = DEEPSEEK_PROVIDER_CONFIG(readKeyCmd);
-      (config as any).apiKey = readKeyCmd;
-      await pi.registerProvider("deepseek", config);
-    } catch (err) {
-      ui.notify?.(`registerProvider 失败：${(err as Error).message}`, "error");
-      await markSetupDone(pi, "skipped");
-      return;
+    ensurePiAgentDir();
+    keyFile = deepSeekKeyPath();
+    if (isWindows) {
+      // Windows 的 chmod 基本是空操作，NTFS ACL 默认仅当前用户可读，
+      // 这里只写文件，不调 chmodSync（避免在某些 Windows 环境下抛异常）。
+      fs.writeFileSync(keyFile, trimmedKey);
+    } else {
+      fs.writeFileSync(keyFile, trimmedKey, { mode: 0o600 });
+      fs.chmodSync(keyFile, 0o600);
     }
-  } else {
-    ui.notify?.(
-      "当前 Pi 版本不支持 registerProvider。请手动配置：\n" +
-        `  export DEEPSEEK_API_KEY="${trimmedKey.slice(0, 8)}..."  # 完整 key 已存到 ${keyFile}\n` +
-        "或把 key 加到 ~/.pi/agent/models.json 的 deepseek provider 配置里。",
-      "warn",
-    );
+  } catch (err) {
+    ui.notify(`保存 key 文件失败：${(err as Error).message}`, "error");
     await markSetupDone(pi, "skipped");
     return;
   }
 
-  ui.notify?.(
+  try {
+    // apiKey 支持 !command 形式：Pi 会执行 `cat <keyFile>` 读取真实 key。
+    const readKeyCmd = `!cat "${keyFile}"`;
+    pi.registerProvider("deepseek", buildDeepSeekProviderConfig(readKeyCmd));
+  } catch (err) {
+    ui.notify(`registerProvider 失败：${(err as Error).message}`, "error");
+    await markSetupDone(pi, "skipped");
+    return;
+  }
+
+  // 平台相关的权限提示：POSIX 上 chmod 600 有效，Windows 上要靠 ACL（默认就是当前用户可读）。
+  const permNote = isWindows
+    ? `Key 已存到 ${keyFile}。Windows 上请确认该文件未被其他用户读取（NTFS 默认 ACL 仅当前用户可读）。`
+    : `Key 已存到 ${keyFile}（权限 600，仅你可读）。`;
+
+  ui.notify(
     "✓ DeepSeek V4-Flash 已配置完成。翻译将使用 V4-Flash（比 Claude 便宜约 16 倍）。\n" +
-      `Key 已存到 ${keyFile}（权限 600，仅你可读）。\n` +
-      "下次启动不再提示。如需更换 key，删除该文件后运行 /translate-setup。",
+      permNote +
+      "\n下次启动不再提示。如需更换 key，删除该文件后运行 /translate-setup。",
     "info",
   );
   await markSetupDone(pi, "configured");
