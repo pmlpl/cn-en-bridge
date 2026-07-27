@@ -1,7 +1,7 @@
 {
-  "name": "pi-translate-output-zh",
-  "version": "0.3.0",
-  "description": "Pi extension: translate assistant English responses to Chinese. Designed to pair with pi-prompt-translate (input side).",
+  "name": "pi-translate-zh-en",
+  "version": "1.0.0",
+  "description": "Pi extension: bidirectional zh<->en translation to save tokens. Translates user Chinese input to English before sending to the model, and translates the model's English response back to Chinese. All-in-one replacement for pi-prompt-translate (input side) + output translation.",
   "type": "module",
   "keywords": ["pi-package"],
   "files": [

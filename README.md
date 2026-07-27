@@ -1,6 +1,6 @@
-# pi-translate-output-zh
+# pi-translate-zh-en
 
-> Pi agent 的输出侧翻译扩展：把模型英文回复自动翻译成中文展示给用户，配合 [pi-prompt-translate](https://www.npmjs.com/package/pi-prompt-translate)（输入侧）实现「用户全程中文，模型全程英文」的省 token 体验。
+> Pi agent 的**一站式中英互转省 token 翻译扩展**：用户输入中文自动翻译成英文发给模型，模型英文回复自动翻译成中文展示给用户。一个包搞定输入+输出双向翻译，无需配合其他扩展。
 
 ## 解决的痛点
 
@@ -17,7 +17,7 @@
 
 ### 痛点 2：现有方案只解决一半
 
-官方市场的 [`pi-prompt-translate`](https://www.npmjs.com/package/pi-prompt-translate) 解决了输入侧（用户中文 → 翻译成英文发给模型），但**不翻译输出**——模型回复你看到的还是英文。用户被迫在「看英文回复」和「省 token」之间二选一。
+官方市场的 [`pi-prompt-translate`](https://www.npmjs.com/package/pi-prompt-translate) 只翻译输入（用户中文 → 翻译成英文发给模型），**不翻译输出**——模型回复你看到的还是英文。用户被迫在「看英文回复」和「省 token」之间二选一。
 
 ### 痛点 3：用主模型翻译不划算
 
@@ -25,25 +25,32 @@
 
 ## 解决方案
 
+**一个扩展搞定双向翻译**，用户全程用中文，模型全程用英文「思考」和「输出」：
+
 ```
-用户输入中文
-    ↓ （pi-prompt-translate 翻译）
+你输入中文
+    ↓ （本扩展 input hook 翻译）
 英文 prompt 发给模型
     ↓ （模型英文推理 + 英文输出）
 英文回复
-    ↓ （本扩展翻译）
-中文展示给用户
+    ↓ （本扩展 message_end hook 翻译）
+中文展示给你
 ```
 
-**用户全程用中文，模型全程用英文「思考」和「输出」**，token 消耗显著降低。
-
-本扩展只负责输出侧（英→中），与 `pi-prompt-translate` 的输入侧（中→英）配对使用。两个扩展 hook 的事件**完全没有交集**，可放心共存。
+**token 消耗显著降低**，而且你看到的始终是中文。
 
 ## 创作思路
 
-### 1. 只 hook 一个事件，最小侵入
+### 1. 一个包搞定，不需要装两个
 
-只 hook `message_end`——拿到 assistant 英文 message 后调小模型翻译成中文，`return { message }` 替换写进 session。其他事件都不动，避免和 `pi-prompt-translate`（hook `input`/`message_start`/`context`）冲突。
+输入侧（中→英）和输出侧（英→中）都在一个包里实现，hook 不同事件，互不冲突：
+
+| 方向 | hook 事件 | 作用 |
+|---|---|---|
+| 输入侧 | `input` | 拦截用户输入，中文 → 翻译成英文，`return {action:"transform", text:英文}` |
+| 输入侧 | `before_agent_start` | 注入 systemPrompt 引导模型用英文回复 |
+| 输出侧 | `message_end` | 拦截 assistant 输出，英文 → 翻译成中文，`return {message}` 替换 |
+| 配置引导 | `session_start` | 首次启动检测 DeepSeek 配置，缺失则引导用户配置 |
 
 ### 2. 只翻译 text part，不破坏工具调用语义
 
@@ -69,17 +76,31 @@ V4-Flash 在 SWE-bench 拿 79.0%，对翻译这种「语义对等转换」任务
 
 翻译不需要 CoT 推理。调用 `completeSimple` 时传 `reasoning: "low"`，砍掉模型思考过程的 token 开销。
 
-### 5. LRU 缓存避免重复翻译
+### 5. 双向 LRU 缓存避免重复翻译
 
-重复的 assistant 回复（比如模型反复说 "Understood" / "Got it"）会命中缓存，不重复调 LLM。`pi-prompt-translate` 没有这个能力。
+输入侧和输出侧各用一个 256 项 LRU 缓存：
+- 重复的用户输入（比如反复说「继续」「好的」）不重复调 LLM
+- 重复的 assistant 回复（比如模型反复说 "Understood" / "Got it"）不重复调 LLM
 
-### 6. 首次启动引导配置 DeepSeek
+### 6. CJK 检测，纯英文输入直接放行
+
+用 Unicode 范围检测用户输入是否包含中文/日文/韩文字符。如果用户输入纯英文或代码，就不调翻译 LLM，避免无谓开销。
+
+### 7. 首次启动引导配置 DeepSeek
 
 默认配置 DeepSeek 需要用户自己拿 API key，对新用户不友好。本扩展在 `session_start` 事件检测 DeepSeek 是否已配置，未配置则弹确认框引导用户粘贴 API key，**全程图形化操作，零环境变量配置**。
 
-### 7. 错误兜底原样透传
+### 8. 错误兜底原样透传
 
-翻译失败时（网络错误 / API 限流 / key 失效）**不阻塞主流程**，原英文回复照常展示给用户，只是看不到中文翻译而已。
+翻译失败时（网络错误 / API 限流 / key 失效）**不阻塞主流程**：
+- 输入侧失败：原中文输入照常发给模型
+- 输出侧失败：原英文回复照常展示给用户
+
+只是看不到翻译而已，不会影响 Pi 正常工作。
+
+### 9. 兼容 pi-prompt-translate
+
+如果用户之前装过 `pi-prompt-translate`，本扩展会检测到它已注册 `/translate-toggle` 命令，**自动禁用输入侧 hook**，避免重复翻译。用户可以渐进迁移，最后卸载 pi-prompt-translate 即可。
 
 ## 安装
 
@@ -88,7 +109,7 @@ V4-Flash 在 SWE-bench 拿 79.0%，对翻译这种「语义对等转换」任务
 - [Pi agent](https://pi.dev/) ≥ 0.74（需要支持 `registerProvider`）
 - 任意已配置的主模型（Claude / GPT / DeepSeek / Qwen 等均可）
 
-### 安装本扩展
+### 安装
 
 ```bash
 # 方式一：从 GitHub 安装（推荐，最新版本）
@@ -99,11 +120,10 @@ git clone https://github.com/pmlpl/cn-en-bridge.git
 pi install ./cn-en-bridge/pi-translate-zh-en
 ```
 
-### 配合输入侧翻译使用（推荐）
+**不需要再装 pi-prompt-translate**——本扩展已经包含输入侧翻译。如果之前装过，可以卸载：
 
 ```bash
-pi install npm:pi-prompt-translate                  # 输入侧：中文 → 英文
-pi install git:https://github.com/pmlpl/cn-en-bridge.git  # 输出侧：英文 → 中文
+pi uninstall pi-prompt-translate   # 可选，本扩展会自动兼容已装的情况
 ```
 
 ## 使用方法
@@ -142,9 +162,9 @@ $ pi
 
 ```
 你：帮我写一个快排算法
-（pi-prompt-translate 把这句中文翻译成英文发给模型）
+（本扩展 input hook 把这句中文翻译成英文发给模型）
 （模型用英文思考和输出）
-（本扩展把英文输出翻译成中文展示）
+（本扩展 message_end hook 把英文输出翻译成中文展示）
 模型：这是快速排序的 Python 实现：
 
 ```python
@@ -166,16 +186,22 @@ def quicksort(arr):
 
 | 命令 | 作用 |
 |---|---|
-| `/translate-output` | 切换输出翻译开关（on/off 之间 toggle） |
-| `/translate-output on` | 开启输出翻译 |
-| `/translate-output off` | 关闭输出翻译 |
-| `/translate-output clear` | 清空翻译缓存 |
+| `/translate` | toggle 全部翻译（输入+输出） |
+| `/translate on` | 开启全部翻译 |
+| `/translate off` | 关闭全部翻译 |
+| `/translate input on` | 只开输入侧（中→英） |
+| `/translate input off` | 只关输入侧 |
+| `/translate output on` | 只开输出侧（英→中） |
+| `/translate output off` | 只关输出侧 |
+| `/translate clear` | 清空双向翻译缓存 |
+| `/translate status` | 查看当前状态（输入/输出开关 + 当前模型） |
 | `/translate-setup` | 重新触发 DeepSeek 配置引导（更换 key 时用） |
 
 ### CLI Flag
 
 ```bash
-pi --no-translate-output        # 本次会话临时关闭输出翻译
+pi --no-translate              # 本次会话临时关闭全部翻译
+pi --no-translate-output       # 只关闭输出侧（输入侧仍翻译）
 ```
 
 ### 环境变量
@@ -213,13 +239,13 @@ pi
 用户输入
     │
     ▼
-[input 事件] ──── pi-prompt-translate 处理（中→英） ────┐
+[input 事件] ──── 本扩展处理（中→英） ─────────────────┐
     │                                                    │
     ▼                                                    │
 [before_agent_start] ── 注入英文 systemPrompt ──────────┤
     │                                                    │
     ▼                                                    │
-模型推理（英文）                                          │
+模型英文推理 + 英文输出                                    │
     │                                                    │
     ▼                                                    │
 [message_end 事件] ── 本扩展处理（英→中） ◄──────────────┘
@@ -232,24 +258,26 @@ pi
 
 ```
 pi-translate-zh-en/
-├── package.json    # Pi 包 manifest（包名 pi-translate-output-zh）
-├── index.ts        # 扩展入口：注册 message_end hook + /translate-output + /translate-setup + session_start 引导
-├── translate.ts    # completeSimple(reasoning:"low") 调 LLM 翻译 + systemPrompt 约束
-└── cache.ts        # LRU 缓存（256 项）
+├── package.json    # Pi 包 manifest（包名 pi-translate-zh-en）
+├── index.ts        # 扩展入口：4 个 hook + /translate + /translate-setup + 首次引导 + CJK 检测 + 兼容检测
+├── translate.ts    # 双向翻译：translateZhToEn + translateEnToZh + completeSimple(reasoning:"low")
+└── cache.ts        # LRU 缓存（256 项 × 2 方向）
 ```
 
 ### 关键设计
 
 | 设计点 | 实现 | 作用 |
 |---|---|---|
-| 只 hook `message_end` | `pi.on("message_end", ...)` | 与 pi-prompt-translate 事件无冲突 |
+| 一个包 hook 4 个事件 | `input` + `before_agent_start` + `message_end` + `session_start` | 输入输出全包，无需配合其他扩展 |
 | 只翻译 `text` part | `content.map(part => part.type === "text" ? 翻译 : part)` | 不破坏 tool_use / thinking 语义 |
 | `reasoning: "low"` | `completeSimple(model, ctx, { reasoning: "low" })` | 跳过推理，省翻译 token |
-| LRU 缓存 | `cache.ts` 256 项 LRU | 重复回复不重复调 LLM |
+| 双向 LRU 缓存 | `zh2enCache` + `en2zhCache` 各 256 项 | 重复输入/回复不重复调 LLM |
+| CJK 检测 | `containsCJK(text)` Unicode 范围判断 | 纯英文/代码输入直接放行，不调 LLM |
 | 复用 Pi auth | `ctx.modelRegistry.getApiKeyAndHeaders(model)` | 不需要单独配翻译 API key |
-| 错误兜底 | `try/catch + ctx.ui.notify("passthrough")` | 翻译失败不阻塞，原英文照常展示 |
+| 错误兜底 | `try/catch + ctx.ui.notify("passthrough")` | 翻译失败不阻塞，原文本照常展示 |
 | 持久化标记 | `~/.pi/agent/.translate-setup-done` 文件 | 避免每次启动都弹引导 |
 | Key 文件权限 0600 | `fs.writeFileSync(keyFile, key, { mode: 0o600 })` | 仅用户可读，不进 git |
+| 兼容 pi-prompt-translate | 检测 `translate-toggle` 命令已注册 | 已装的话自动让出输入侧 |
 
 ### DeepSeek 峰谷定价注意
 
@@ -269,27 +297,31 @@ export TRANSLATE_MODEL="anthropic/claude-haiku-4-5"
 
 ## FAQ
 
-### Q: 必须装 pi-prompt-translate 吗？
+### Q: 必须配置 DeepSeek 吗？
 
-**不是必须的**。本扩展可以独立工作——只翻译输出，不翻译输入。
+**不是必须的**。不配置 DeepSeek 不会报错——翻译会 fallback 到当前主模型（比如 Claude Sonnet）。
 
-但单独使用时体验是：用户输入中文 → 模型直接处理中文（不省钱）→ 模型英文输出 → 翻译成中文。**输入侧不省钱**。
+但这样不省钱——主模型价格高，且每次翻译都要等主模型生成完才能开始，延迟更长。建议配置 DeepSeek 享受 16 倍价差。
 
-要达到「全程省 token」效果，必须两个扩展一起装。
+### Q: 已经装了 pi-prompt-translate 怎么办？
 
-### Q: 不配置 DeepSeek 会怎样？
+**两个选择**：
 
-**不会报错**。翻译会 fallback 到当前主模型（比如 Claude Sonnet）。
+1. **保留两个**（推荐先这样）：本扩展会检测到 pi-prompt-translate 已装，自动禁用自己的输入侧 hook，让 pi-prompt-translate 负责输入翻译。本扩展只负责输出翻译。功能不冲突。
 
-但这样不省钱——主模型价格高，且每次翻译都要等主模型生成完才能开始，延迟更长。
+2. **卸载 pi-prompt-translate**（更干净）：本扩展已经实现了输入侧翻译，完全不需要 pi-prompt-translate。卸载后本扩展会自动接管输入侧。
+
+```bash
+pi uninstall pi-prompt-translate
+```
 
 ### Q: 翻译会破坏代码块吗？
 
 **不会**。systemPrompt 明确要求保留代码块、文件路径、变量名、技术术语：
 
 ```
-Translate the following user message to Chinese.
-Preserve all code blocks, file paths, variable names, technical terms exactly.
+Translate the following user message to English.
+Preserve all code blocks, file paths, variable names, command names, URLs, and technical terms exactly.
 Only translate natural language portions.
 Do NOT add explanations, thinking, or commentary.
 Output ONLY the translated text.
@@ -297,9 +329,11 @@ Output ONLY the translated text.
 
 ### Q: 翻译失败怎么办？
 
-**原英文回复照常展示**，并显示警告通知 `Output translation failed (passthrough): <错误原因>`。
+**不阻塞主流程**：
+- 输入侧失败：原中文输入照常发给模型
+- 输出侧失败：原英文回复照常展示给用户
 
-主流程不阻塞，用户仍能看到模型的英文回复。
+并显示警告通知 `translation failed (passthrough): <错误原因>`。
 
 ### Q: 如何更换 DeepSeek API key？
 
@@ -318,7 +352,7 @@ pi
 
 ```bash
 # 1. 卸载扩展
-pi uninstall pi-translate-output-zh
+pi uninstall pi-translate-zh-en
 
 # 2. 清理配置文件（可选）
 rm ~/.pi/agent/.deepseek-key
@@ -327,7 +361,16 @@ rm ~/.pi/agent/.translate-setup-done
 
 ### Q: 支持其他语言对吗？
 
-当前只支持英→中。如果有其他语言需求，修改 [translate.ts](pi-translate-zh-en/translate.ts) 里的 `EN2ZH_SYSTEM_PROMPT` 即可。
+当前只支持中↔英双向。如果有其他语言需求，修改 [translate.ts](pi-translate-zh-en/translate.ts) 里的 `ZH2EN_SYSTEM_PROMPT` 和 `EN2ZH_SYSTEM_PROMPT` 即可。
+
+### Q: 输入翻译会不会有延迟？
+
+会有一点延迟（同步翻译，等 LLM 返回）。如果觉得卡顿，可以临时关闭输入侧：
+
+```bash
+pi
+/translate input off    # 只关输入侧，输出侧仍翻译
+```
 
 ## 开发
 
@@ -361,12 +404,12 @@ MIT
 
 ## 致谢
 
-- [pi-prompt-translate](https://github.com/Veucci/pi-prompt-translate) by Veucci — 输入侧翻译的参考实现
+- [pi-prompt-translate](https://github.com/Veucci/pi-prompt-translate) by Veucci — 输入侧翻译的参考实现，本扩展的 input hook 设计参考了它
 - [Pi mono](https://github.com/badlogic/pi-mono) by Mario Zechner — Pi agent 本体
 - [Custom providers in Pi](https://aliou.me/posts/custom-providers-in-pi/) by Aliou — registerProvider 用法参考
 
 ## 相关项目
 
-- [pi-prompt-translate](https://www.npmjs.com/package/pi-prompt-translate) — 输入侧翻译（中文→英文），与本扩展配对使用
+- [pi-prompt-translate](https://www.npmjs.com/package/pi-prompt-translate) — 仅输入侧翻译（中文→英文），本扩展已包含其功能
 - [pi-tool-i18n](https://www.npmjs.com/package/pi-tool-i18n) — 翻译工具 schema 描述（不同场景）
 - [pi-lean-ctx](https://www.jsdelivr.com/package/npm/pi-lean-ctx) — 压缩 bash/read/grep 输出省 token
