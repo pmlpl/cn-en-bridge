@@ -1,14 +1,33 @@
 {
-  "name": "pi-translate-zh-en",
+  "name": "@pmlpm/pi-translate-zh-en",
   "version": "1.0.0",
   "description": "Pi extension: bidirectional zh<->en translation to save tokens. Translates user Chinese input to English before sending to the model, and translates the model's English response back to Chinese. All-in-one replacement for pi-prompt-translate (input side) + output translation.",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": ["pi-package", "pi", "translation", "translate", "chinese", "english", "token-saving", "deepseek"],
+  "license": "MIT",
+  "author": "pmlpl <https://github.com/pmlpl>",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pmlpl/cn-en-bridge.git",
+    "directory": "pi-translate-zh-en"
+  },
+  "homepage": "https://github.com/pmlpl/cn-en-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/pmlpl/cn-en-bridge/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "files": [
     "index.ts",
     "translate.ts",
     "cache.ts",
-    "cjk.ts"
+    "cjk.ts",
+    "README.md",
+    "LICENSE"
   ],
   "pi": {
     "extensions": ["./index.ts"]
